@@ -23,7 +23,7 @@ LOG_MODULE_REGISTER(ad5940_port, LOG_LEVEL_INF);
 
 /* ---------- Devicetree handles ---------- */
 
-static const struct device *spi_dev = DEVICE_DT_GET(DT_NODELABEL(spi2));
+static const struct device *spi_dev = DEVICE_DT_GET(DT_NODELABEL(spi4));
 
 static const struct spi_config spi_cfg = {
 	.frequency  = 1000000,

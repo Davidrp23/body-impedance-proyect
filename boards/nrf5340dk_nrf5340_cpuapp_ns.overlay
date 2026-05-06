@@ -25,6 +25,9 @@
 		rst_pin: rst_pin {
 			gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;
 		};
+		cs_pin: cs_pin {
+			gpios = <&gpio1 12 GPIO_ACTIVE_LOW>;
+		};
 		int_pin: int_pin {
 			gpios = <&gpio1 4 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
 		};
