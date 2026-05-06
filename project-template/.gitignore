@@ -1,0 +1,16 @@
+# editors
+*.swp
+*~
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# build
+/build*/
+
+# Python
+__pycache__/
+*.pyc

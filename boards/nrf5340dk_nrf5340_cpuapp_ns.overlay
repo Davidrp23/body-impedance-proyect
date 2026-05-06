@@ -1,0 +1,32 @@
+/*
+ * AD5940 on nRF5340 DK using Arduino header SPI (spi4)
+ *   SCK  -> D13 -> P1.15  (handled by spi4 pinctrl)
+ *   MOSI -> D11 -> P1.13  (handled by spi4 pinctrl)
+ *   MISO -> D12 -> P1.14  (handled by spi4 pinctrl)
+ *   CS   -> D10 -> P1.12  (handled by spi4 cs-gpios)
+ *   INT  -> D2  -> P1.04  (AD5940 GP0 interrupt)
+ *   RST  ->       P0.07
+ */
+
+&spi4 {
+	status = "okay";
+	/* cs-gpios already defined in base DTS: &arduino_header 0x10 GPIO_ACTIVE_LOW = P1.12 */
+
+	ad5940: ad5940@0 {
+		compatible = "vnd,spi-device";
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+	};
+};
+
+/ {
+	ad5940_gpios {
+		compatible = "gpio-leds";
+		rst_pin: rst_pin {
+			gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;
+		};
+		int_pin: int_pin {
+			gpios = <&gpio1 4 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+		};
+	};
+};

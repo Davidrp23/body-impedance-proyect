@@ -1,0 +1,5 @@
+/*
+ * Devicetree overlay for nRF5340 DK
+ * Add your peripheral and pin configurations here.
+ * See: https://docs.zephyrproject.org/latest/build/dts/howtos.html
+ */

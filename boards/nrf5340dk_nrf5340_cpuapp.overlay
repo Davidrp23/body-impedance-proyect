@@ -1,0 +1,58 @@
+/*
+ * AD5940 on nRF5340 DK using Arduino header pins with SPIM2
+ * (simpler peripheral than SPIM4 — no high-speed DMA)
+ *
+ *   SCK  -> D13 -> P1.15
+ *   MOSI -> D11 -> P1.13
+ *   MISO -> D12 -> P1.14
+ *   CS   -> D10 -> P1.12  (manual GPIO)
+ *   INT  -> D2  -> P1.04
+ *   RST  ->       P0.07
+ */
+
+/* Disable SPIM4 — we use SPIM2 instead */
+&spi4 {
+	status = "disabled";
+};
+
+&pinctrl {
+	spi2_default: spi2_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 1, 15)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 13)>,
+				<NRF_PSEL(SPIM_MISO, 1, 14)>;
+		};
+	};
+	spi2_sleep: spi2_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 1, 15)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 13)>,
+				<NRF_PSEL(SPIM_MISO, 1, 14)>;
+			low-power-enable;
+		};
+	};
+};
+
+&spi2 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+	pinctrl-0 = <&spi2_default>;
+	pinctrl-1 = <&spi2_sleep>;
+	pinctrl-names = "default", "sleep";
+	/delete-property/ cs-gpios;
+};
+
+/ {
+	ad5940_gpios {
+		compatible = "gpio-leds";
+		cs_pin: cs_pin {
+			gpios = <&gpio1 12 GPIO_ACTIVE_LOW>;
+		};
+		rst_pin: rst_pin {
+			gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;
+		};
+		int_pin: int_pin {
+			gpios = <&gpio1 4 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+		};
+	};
+};
