@@ -10,15 +10,18 @@ import time
 import csv
 import os
 import hashlib
+import sqlite3
+import json
 from scipy.optimize import least_squares
 
-# --- CONFIGURACIONES GLOBALES BIOMETRÍA ---
+# --- CONFIGURACIONES GLOBALES ---
 PASSWORD_DB_FILE = "secret.dat"
 DEFAULT_PASSWORD = "nordic123"
+DB_FILE = "biometria.db"
 MAX_USUARIOS = 5
 UMBRAL_CONFIANZA = 0.85
 
-# --- FUNCIONES DE SEGURIDAD (HASHING) ---
+# --- FUNCIONES DE SEGURIDAD Y BASE DE DATOS ---
 def hash_password(password):
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
@@ -38,8 +41,18 @@ def update_stored_hash(new_password):
     with open(PASSWORD_DB_FILE, "w") as f:
         f.write(hash_password(new_password))
 
-# --- FUNCIONES DE EXTRACCIÓN Y SISTEMA BIOMÉTRICO ---
+def init_db():
+    """Inicializa la base de datos SQLite y crea las tablas si no existen."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS usuarios 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS caracteristicas 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, usuario_id INTEGER, features TEXT)''')
+    conn.commit()
+    conn.close()
 
+# --- FUNCIONES DE EXTRACCIÓN MATEMÁTICA ---
 def fit_cole_model_ideal(frecuencias, magnitudes, fases):
     f = np.array(frecuencias)
     mag = np.array(magnitudes)
@@ -50,15 +63,11 @@ def fit_cole_model_ideal(frecuencias, magnitudes, fases):
     
     def residual(params):
         R0, Rinf, fc = params
-        if fc <= 0:
-            return np.ones(2 * len(f)) * 1e6
-            
+        if fc <= 0: return np.ones(2 * len(f)) * 1e6
         omega_ratio = f / fc
         den = 1 + omega_ratio**2
-        
         Z_model_real = Rinf + (R0 - Rinf) / den
         Z_model_imag = -(R0 - Rinf) * omega_ratio / den
-        
         return np.concatenate((Z_model_real - Z_real_data, Z_model_imag - Z_imag_data))
         
     R0_guess = mag[0] if len(mag) > 0 else 1000.0
@@ -89,8 +98,8 @@ def calcular_caracteristicas(frecuencias, magnitudes, fases, metodo="Regresión 
     
     log_freq = np.log10(frecuencias)
     log_mag = np.log10(magnitudes)
-    log_R = np.log10(np.abs(R))
-    log_X = np.log10(np.abs(X))
+    log_R = np.log10(np.maximum(np.abs(R), 1e-6))
+    log_X = np.log10(np.maximum(np.abs(X), 1e-6))
     
     slope_mag, int_mag = np.polyfit(log_freq, log_mag, 1)
     slope_R, int_R = np.polyfit(log_freq, log_R, 1)
@@ -98,26 +107,67 @@ def calcular_caracteristicas(frecuencias, magnitudes, fases, metodo="Regresión 
     
     return [max_mag, slope_mag, int_mag, slope_R, int_R, slope_X, int_X]
 
+# --- SISTEMA BIOMÉTRICO (AHORA CONECTADO A SQLITE) ---
 class SistemaBiometrico:
     def __init__(self):
         self.usuarios_registrados = {} 
         self.dataset_features = []
         self.dataset_labels = []
         self.modelo_entrenado = False
+        self.cargar_desde_db()
+
+    def cargar_desde_db(self):
+        """Carga los usuarios y sus características desde SQLite a la memoria RAM."""
+        self.usuarios_registrados.clear()
+        self.dataset_features.clear()
+        self.dataset_labels.clear()
+        
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        c.execute("SELECT id, nombre FROM usuarios")
+        for row in c.fetchall():
+            self.usuarios_registrados[row[0]] = row[1]
+            
+        c.execute("SELECT usuario_id, features FROM caracteristicas")
+        for row in c.fetchall():
+            uid = row[0]
+            feats = json.loads(row[1])
+            self.dataset_labels.append(uid)
+            self.dataset_features.append(feats)
+            
+        conn.close()
+        self.entrenar_modelo()
 
     def entrenar_modelo(self):
-        if len(self.usuarios_registrados) > 0:
-            self.modelo_entrenado = True
+        self.modelo_entrenado = len(self.usuarios_registrados) > 0
 
     def agregar_usuario(self, nombre, features_list):
-        nuevo_id = len(self.usuarios_registrados)
-        self.usuarios_registrados[nuevo_id] = nombre
+        """Guarda un nuevo usuario en la base de datos y actualiza la RAM."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        c.execute("INSERT INTO usuarios (nombre) VALUES (?)", (nombre,))
+        nuevo_id = c.lastrowid
         
         for features in features_list:
-            self.dataset_features.append(features)
-            self.dataset_labels.append(nuevo_id)
+            # Guardamos el array de características como un texto JSON
+            c.execute("INSERT INTO caracteristicas (usuario_id, features) VALUES (?, ?)", 
+                      (nuevo_id, json.dumps(list(features))))
             
-        self.entrenar_modelo()
+        conn.commit()
+        conn.close()
+        self.cargar_desde_db() # Refrescar RAM
+
+    def borrar_usuario(self, uid):
+        """Elimina a un usuario y sus mediciones de la base de datos."""
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM usuarios WHERE id = ?", (uid,))
+        c.execute("DELETE FROM caracteristicas WHERE usuario_id = ?", (uid,))
+        conn.commit()
+        conn.close()
+        self.cargar_desde_db() # Refrescar RAM
 
     def identificar_usuario(self, features_desconocidas):
         if not self.modelo_entrenado:
@@ -150,21 +200,23 @@ class SistemaBiometrico:
                 mejor_id = uid
 
         if mejor_id is None:
-            return False, "Error dimensional (Cambio de modelo)", 0.0
+            return False, "Error dimensional", 0.0
 
         if mejor_similitud >= UMBRAL_CONFIANZA:
             return True, f"Bienvenido, {self.usuarios_registrados[mejor_id]}", mejor_similitud
         else:
             candidato = self.usuarios_registrados[mejor_id] if mejor_id is not None else "N/A"
-            return False, f"Acceso denegado (Intento: {candidato})", mejor_similitud
+            return False, f"Acceso denegado (Similar a: {candidato})", mejor_similitud
 
+# --- INTERFAZ GRÁFICA PRINCIPAL ---
 class SerialPlotterApp:
     def __init__(self, master):
         self.master = master
-        master.title("Ploteador Serial AD5940")
+        master.title("Ploteador Serial AD5940 - Base de Datos SQLite")
 
-        # Inicializar sistema de contraseña
+        # Inicialización de subsistemas (Archivos y DB)
         initialize_password()
+        init_db()
 
         self.serial_port = None
         self.is_connected = False
@@ -172,14 +224,12 @@ class SerialPlotterApp:
         self.stop_event = threading.Event()
         
         self.sistema = SistemaBiometrico()
-        
-        # Variable para la configuración de autoguardado
         self.auto_save_csv = tk.BooleanVar(value=False)
 
         self.frequencies = []
         self.magnitudes = []
         self.phases = []
-        self.last_raw_sweeps = [] # Guarda los datos crudos de los últimos 5 barridos
+        self.last_raw_sweeps = [] 
 
         self.create_widgets()
         self.setup_plot()
@@ -190,7 +240,6 @@ class SerialPlotterApp:
             style.theme_use('clam')
 
         self.status_var = tk.StringVar(value="Listo")
-
         control_frame = ttk.Frame(self.master, padding="10")
         control_frame.pack(side=tk.TOP, fill="x")
 
@@ -218,7 +267,6 @@ class SerialPlotterApp:
         # Command Frame
         command_frame = ttk.LabelFrame(control_frame, text="Adquisición y Datos", padding="10")
         command_frame.pack(side=tk.LEFT, fill="both", expand=True, padx=(5, 0))
-        
         command_frame.columnconfigure(0, weight=1)
         command_frame.columnconfigure(1, weight=1)
         command_frame.columnconfigure(2, weight=1)
@@ -261,8 +309,6 @@ class SerialPlotterApp:
         # Plot Frame
         self.plot_frame = ttk.Frame(self.master, padding="10")
         self.plot_frame.pack(side=tk.TOP, fill="both", expand=True)
-
-        # Status Bar
         status_bar = ttk.Label(self.master, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, padding="2")
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -273,7 +319,6 @@ class SerialPlotterApp:
         ports = serial.tools.list_ports.comports()
         port_list = [port.device for port in ports]
         self.port_combobox['values'] = port_list
-        
         if port_list:
             arduino_port = next((p for p in port_list if "ACM" in p or "USB" in p), port_list[0])
             self.port_combobox.set(arduino_port)
@@ -292,8 +337,7 @@ class SerialPlotterApp:
             self.identify_btn.config(state=tk.NORMAL)
             self.set_status(f"Conectado a {port} a {baud_rate} bps")
         except Exception as e:
-            messagebox.showerror("Error de Conexión Serial", str(e))
-            self.set_status("La conexión falló.")
+            messagebox.showerror("Error", str(e))
             self.is_connected = False
 
     def disconnect_serial(self):
@@ -307,56 +351,44 @@ class SerialPlotterApp:
             self.disconnect_button.config(state=tk.DISABLED)
             self.send_button.config(state=tk.DISABLED)
             self.identify_btn.config(state=tk.DISABLED)
-            self.set_status("Desconectado del puerto serial.")
+            self.set_status("Desconectado.")
 
     def setup_plot(self):
         self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(8, 6))
         self.fig.suptitle("Datos BIA AD5940", fontsize=14, fontweight='bold')
         self.fig.tight_layout(pad=3.0)
 
-        self.line_mag, = self.ax1.plot([], [], 'r-o', label='Magnitud (Ohm)', linewidth=2, markersize=4)
+        self.line_mag, = self.ax1.plot([], [], 'r-o', linewidth=2, markersize=4)
         self.ax1.set_ylabel('Magnitud (Ohm)', fontweight='bold')
-        self.ax1.set_xscale('log')
-        self.ax1.grid(True, which="both", ls="--", alpha=0.5)
-        self.ax1.legend()
+        self.ax1.set_xscale('log'); self.ax1.grid(True, which="both", ls="--", alpha=0.5)
 
-        self.line_phase, = self.ax2.plot([], [], 'b-o', label='Fase (grados)', linewidth=2, markersize=4)
+        self.line_phase, = self.ax2.plot([], [], 'b-o', linewidth=2, markersize=4)
         self.ax2.set_xlabel('Frecuencia (Hz)', fontweight='bold')
         self.ax2.set_ylabel('Fase (grados)', fontweight='bold')
-        self.ax2.set_xscale('log')
-        self.ax2.grid(True, which="both", ls="--", alpha=0.5)
-        self.ax2.legend()
+        self.ax2.set_xscale('log'); self.ax2.grid(True, which="both", ls="--", alpha=0.5)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
-        self.canvas_widget = self.canvas.get_tk_widget()
-        self.canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.toolbar = NavigationToolbar2Tk(self.canvas, self.plot_frame)
-        self.toolbar.update()
-        
         self.canvas.draw()
 
     def update_plot(self):
         self.line_mag.set_data(self.frequencies, self.magnitudes)
         self.line_phase.set_data(self.frequencies, self.phases)
-
         if self.frequencies:
-            self.ax1.relim()
-            self.ax1.autoscale_view()
-            self.ax2.relim()
-            self.ax2.autoscale_view()
-            self.ax1.set_xlim(min(self.frequencies) * 0.9, max(self.frequencies) * 1.1)
-            self.ax2.set_xlim(min(self.frequencies) * 0.9, max(self.frequencies) * 1.1)
-
+            self.ax1.relim(); self.ax1.autoscale_view()
+            self.ax2.relim(); self.ax2.autoscale_view()
+            self.ax1.set_xlim(min(self.frequencies)*0.9, max(self.frequencies)*1.1)
+            self.ax2.set_xlim(min(self.frequencies)*0.9, max(self.frequencies)*1.1)
         self.canvas.draw_idle()
 
-    # --- FUNCIONES DE LECTURA Y ESCRITURA CSV PARA BARRIDOS ---
+    # --- FUNCIONES DE ARCHIVOS CSV ---
     def read_csv_file(self, filepath):
         sweeps = []
         try:
             with open(filepath, 'r') as f:
                 reader = csv.reader(f)
-                next(reader, None) # Saltar encabezado
+                next(reader, None) 
                 freqs, mags, phases = [], [], []
                 for row in reader:
                     if len(row) >= 3:
@@ -364,8 +396,7 @@ class SerialPlotterApp:
                             freqs.append(float(row[0]))
                             mags.append(float(row[1]))
                             phases.append(float(row[2]))
-                        except ValueError:
-                            pass
+                        except ValueError: pass
                 
                 chunk_size = 48
                 if len(freqs) >= chunk_size:
@@ -377,32 +408,45 @@ class SerialPlotterApp:
                             sweeps.append((chunk_f, chunk_m, chunk_p))
                 elif len(freqs) > 0:
                     sweeps.append((freqs, mags, phases))
-                    
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo leer el archivo CSV:\n{e}")
         return sweeps
 
     def save_raw_sweeps_to_csv(self):
-        if not self.last_raw_sweeps:
-            return
-            
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("Archivos CSV", "*.csv")],
-            title="Guardar los 5 barridos de registro"
-        )
+        if not self.last_raw_sweeps: return
+        filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("Archivos CSV", "*.csv")], title="Guardar los 5 barridos")
         if filepath:
             try:
                 with open(filepath, 'w', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerow(["Frecuencia (Hz)", "Magnitud (Ohm)", "Fase (grados)"])
                     for sweep in self.last_raw_sweeps:
-                        for row in sweep:
-                            writer.writerow(row)
-                self.set_status(f"Barridos guardados exitosamente en {filepath}")
+                        for row in sweep: writer.writerow(row)
+                self.set_status(f"Guardado en {filepath}")
             except Exception as e:
-                messagebox.showerror("Error al Guardar", str(e))
+                messagebox.showerror("Error", str(e))
 
+    def save_data(self):
+        if not self.frequencies:
+            messagebox.showwarning("Sin Datos", "No hay datos para guardar.")
+            return
+        filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if filepath:
+            try:
+                with open(filepath, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Frecuencia (Hz)", "Magnitud (Ohm)", "Fase (grados)"])
+                    for freq, mag, phase in zip(self.frequencies, self.magnitudes, self.phases):
+                        writer.writerow([freq, mag, phase])
+                self.set_status("Datos guardados exitosamente")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    def clear_data(self):
+        self.frequencies, self.magnitudes, self.phases = [], [], []
+        self.update_plot()
+
+    # --- LECTURA SERIAL Y FLUJOS ---
     def read_serial_data(self, mode="single", user_name="", metodo_extraccion="Regresión Lineal"):
         num_points = 48
         num_sweeps = 5 if mode == "register" else 1
@@ -411,30 +455,18 @@ class SerialPlotterApp:
 
         try:
             self.master.after(0, self.disable_buttons)
-
             for sweep in range(num_sweeps):
-                if self.stop_event.is_set():
-                    break
+                if self.stop_event.is_set(): break
+                self.set_status(f"Adquiriendo barrido {sweep+1}/{num_sweeps}..." if mode=="register" else "Adquiriendo datos...")
 
-                if mode == "register":
-                    self.set_status(f"Adquiriendo barrido {sweep+1}/{num_sweeps}...")
-                else:
-                    self.set_status("Adquiriendo datos...")
-
-                self.frequencies = []
-                self.magnitudes = []
-                self.phases = []
-                current_raw_sweep = []
-                
+                self.frequencies, self.magnitudes, self.phases, current_raw_sweep = [], [], [], []
                 self.master.after(0, self.update_plot)
-
                 self.serial_port.flushInput()
                 self.serial_port.write(b"send\n")
 
                 received_points = 0
-                for i in range(num_points):
-                    if self.stop_event.is_set():
-                        break
+                for _ in range(num_points):
+                    if self.stop_event.is_set(): break
                     line = self.serial_port.readline().decode('utf-8', errors='ignore').strip()
                     if line:
                         try:
@@ -446,21 +478,16 @@ class SerialPlotterApp:
                                 self.phases.append(wrapped_phase)
                                 current_raw_sweep.append([data[0], data[1], wrapped_phase])
                                 received_points += 1
-                                
-                                if received_points % 4 == 0:
-                                    self.master.after(0, self.update_plot)
-                        except ValueError:
-                            pass
+                                if received_points % 4 == 0: self.master.after(0, self.update_plot)
+                        except ValueError: pass
                 
                 self.master.after(0, self.update_plot)
                 
                 if received_points > 0 and not self.stop_event.is_set():
-                    features = calcular_caracteristicas(self.frequencies, self.magnitudes, self.phases, metodo_extraccion)
-                    sweeps_features.append(features)
+                    feat = calcular_caracteristicas(self.frequencies, self.magnitudes, self.phases, metodo_extraccion)
+                    sweeps_features.append(feat)
                     self.last_raw_sweeps.append(current_raw_sweep)
-
-                if sweep < num_sweeps - 1 and not self.stop_event.is_set():
-                    time.sleep(0.5)
+                if sweep < num_sweeps - 1 and not self.stop_event.is_set(): time.sleep(0.5)
 
             if not self.stop_event.is_set():
                 if mode == "identify" and sweeps_features:
@@ -468,74 +495,27 @@ class SerialPlotterApp:
                 elif mode == "register":
                     if len(sweeps_features) == num_sweeps:
                         self.master.after(0, lambda: self.process_registration(user_name, sweeps_features))
-                        # Si el flag está activo, solicitar guardar el CSV automáticamente
-                        if self.auto_save_csv.get():
-                            self.master.after(500, self.save_raw_sweeps_to_csv)
-                    else:
-                        self.set_status("Registro incompleto.")
-                else:
-                    self.set_status(f"Adquisición completada. {received_points} puntos recibidos.")
-            else:
-                self.set_status("Adquisición detenida.")
+                        if self.auto_save_csv.get(): self.master.after(500, self.save_raw_sweeps_to_csv)
+                    else: self.set_status("Registro incompleto.")
+                else: self.set_status("Adquisición completada.")
+            else: self.set_status("Detenida.")
             
-        except serial.SerialException as e:
-            messagebox.showerror("Error de Lectura Serial", str(e))
-            self.set_status("Error de Lectura Serial.")
-            self.master.after(0, self.disconnect_serial)
         except Exception as e:
             messagebox.showerror("Error", str(e))
-            self.set_status("Error durante la adquisición.")
+            self.master.after(0, self.disconnect_serial)
         finally:
             self.master.after(0, self.enable_buttons)
 
-    def clear_data(self):
-        self.frequencies = []
-        self.magnitudes = []
-        self.phases = []
-        self.update_plot()
-        self.set_status("Gráfica limpiada.")
-
-    def save_data(self):
-        if not self.frequencies:
-            messagebox.showwarning("Sin Datos", "No hay datos para guardar.")
-            return
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("Archivos CSV", "*.csv"), ("Todos los Archivos", "*.*")],
-            title="Guardar Datos BIA"
-        )
-        if filepath:
-            try:
-                with open(filepath, 'w', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["Frecuencia (Hz)", "Magnitud (Ohm)", "Fase (grados)"])
-                    for freq, mag, phase in zip(self.frequencies, self.magnitudes, self.phases):
-                        writer.writerow([freq, mag, phase])
-                self.set_status(f"Datos guardados exitosamente en {filepath}")
-            except Exception as e:
-                messagebox.showerror("Error al Guardar Archivo", str(e))
-                self.set_status("Error al guardar los datos.")
-
-    def start_acquisition(self):
-        self.start_acquisition_task("single")
-
-    def start_identification(self):
-        self.start_acquisition_task("identify")
-
-    def start_registration(self, user_name):
-        self.start_acquisition_task("register", user_name)
+    def start_acquisition(self): self.start_acquisition_task("single")
+    def start_identification(self): self.start_acquisition_task("identify")
+    def start_registration(self, user_name): self.start_acquisition_task("register", user_name)
 
     def start_acquisition_task(self, mode="single", user_name=""):
         if not self.is_connected:
-            messagebox.showwarning("No Conectado", "Por favor, conéctese a un puerto serial primero.")
+            messagebox.showwarning("Atención", "Conéctese al puerto serial primero.")
             return
-
-        metodo_seleccionado = self.model_var.get()
-
         self.stop_event.clear()
-        self.read_thread = threading.Thread(target=self.read_serial_data, args=(mode, user_name, metodo_seleccionado))
-        self.read_thread.daemon = True
-        self.read_thread.start()
+        threading.Thread(target=self.read_serial_data, args=(mode, user_name, self.model_var.get()), daemon=True).start()
 
     def disable_buttons(self):
         self.send_button.config(state=tk.DISABLED)
@@ -560,119 +540,124 @@ class SerialPlotterApp:
         self.sistema.agregar_usuario(user_name, sweeps_features)
         self.bio_result_var.set(f"Usuario {user_name} registrado")
         self.bio_result_lbl.config(foreground="green")
-        messagebox.showinfo("Registro Exitoso", f"Usuario '{user_name}' registrado exitosamente en la base de datos.")
+        messagebox.showinfo("Éxito", f"Usuario '{user_name}' guardado en la Base de Datos SQLite.")
 
-    # --- PANEL ADMINISTRADOR COMPLETAMENTE RESTAURADO Y ACTUALIZADO ---
+    # --- PANEL ADMINISTRADOR (INTEGRACIÓN SQLITE Y CSV) ---
     def open_admin_panel(self):
-        pwd = simpledialog.askstring("Login de Administrador", "Ingrese contraseña de administrador:", show='*')
+        pwd = simpledialog.askstring("Admin", "Ingrese contraseña:", show='*')
         if not pwd or not verify_password(get_stored_hash(), pwd):
-            if pwd is not None:
-                messagebox.showerror("Error", "Contraseña incorrecta")
+            if pwd is not None: messagebox.showerror("Error", "Contraseña incorrecta")
             return
             
         admin_win = tk.Toplevel(self.master)
-        admin_win.title("Panel de Administrador")
-        admin_win.geometry("450x580") 
+        admin_win.title("Panel de Administrador DB")
+        admin_win.geometry("450x650") 
         
-        ttk.Label(admin_win, text="GESTIÓN DE USUARIOS", font=("Helvetica", 10, "bold")).pack(pady=10)
-        ttk.Label(admin_win, text=f"Usuarios Registrados: {len(self.sistema.usuarios_registrados)}/{MAX_USUARIOS}").pack()
+        ttk.Label(admin_win, text="BASE DE DATOS DE USUARIOS (SQLite)", font=("Helvetica", 10, "bold")).pack(pady=(15, 5))
         
-        listbox = tk.Listbox(admin_win, height=5)
-        for uid, unombre in self.sistema.usuarios_registrados.items():
-            listbox.insert(tk.END, f"ID {uid}: {unombre}")
-        listbox.pack(fill=tk.BOTH, padx=20, pady=5)
+        # Frame para la lista y el botón de borrar
+        list_frame = ttk.Frame(admin_win)
+        list_frame.pack(fill=tk.BOTH, padx=20, pady=5)
         
+        lbl_count = ttk.Label(list_frame, text="")
+        lbl_count.pack(anchor="w")
+        
+        listbox = tk.Listbox(list_frame, height=6)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        scrollbar.pack(side=tk.RIGHT, fill="y")
+        listbox.config(yscrollcommand=scrollbar.set)
+        
+        # Función para refrescar la lista desde la RAM (que ya está sincronizada con SQLite)
+        def actualizar_lista():
+            listbox.delete(0, tk.END)
+            for uid, unombre in self.sistema.usuarios_registrados.items():
+                listbox.insert(tk.END, f"ID {uid} - {unombre}")
+            lbl_count.config(text=f"Registrados: {len(self.sistema.usuarios_registrados)} / {MAX_USUARIOS}")
+
+        actualizar_lista()
+        
+        # --- BOTÓN ELIMINAR USUARIO ---
+        def on_delete_user():
+            seleccion = listbox.curselection()
+            if not seleccion:
+                messagebox.showwarning("Atención", "Seleccione un usuario de la lista.")
+                return
+            item_text = listbox.get(seleccion[0])
+            uid = int(item_text.split(" ")[1]) # Extrae el ID (ej: "ID 3 - Juan" -> 3)
+            
+            if messagebox.askyesno("Confirmar", f"¿Borrar permanentemente al usuario '{self.sistema.usuarios_registrados[uid]}' de la base de datos?"):
+                self.sistema.borrar_usuario(uid)
+                actualizar_lista()
+                messagebox.showinfo("Borrado", "Usuario eliminado de SQLite.")
+
+        ttk.Button(admin_win, text="🗑️ Borrar Seleccionado", command=on_delete_user).pack(pady=5)
+        
+        ttk.Separator(admin_win, orient='horizontal').pack(fill='x', pady=10, padx=20)
+        
+        # --- AGREGAR USUARIOS ---
         ttk.Label(admin_win, text="Nombre del nuevo usuario:").pack(pady=5)
         name_var = tk.StringVar()
         ttk.Entry(admin_win, textvariable=name_var).pack(padx=20, fill=tk.X)
         
-        # Funciones de botones
         def on_register():
             name = name_var.get().strip()
-            if not name:
-                messagebox.showwarning("Atención", "El nombre no puede estar vacío.")
-                return
-            if len(self.sistema.usuarios_registrados) >= MAX_USUARIOS:
-                messagebox.showerror("Error", f"Límite de {MAX_USUARIOS} usuarios alcanzado.")
-                return
+            if not name: return messagebox.showwarning("Error", "Nombre vacío.")
+            if len(self.sistema.usuarios_registrados) >= MAX_USUARIOS: return messagebox.showerror("Error", "Límite alcanzado.")
             
             admin_win.destroy()
-            modelo_actual = self.model_var.get()
-            messagebox.showinfo("Registro", f"Se iniciará la recopilación usando: {modelo_actual}.\nMantenga el brazo quieto (5 barridos).")
+            messagebox.showinfo("Registro", "Mantenga el brazo quieto (5 barridos).")
             self.start_registration(name)
             
         def on_register_csv():
             name = name_var.get().strip()
-            if not name:
-                messagebox.showwarning("Atención", "El nombre no puede estar vacío.")
-                return
-            if len(self.sistema.usuarios_registrados) >= MAX_USUARIOS:
-                messagebox.showerror("Error", f"Límite de {MAX_USUARIOS} usuarios alcanzado.")
-                return
+            if not name: return messagebox.showwarning("Error", "Nombre vacío.")
+            if len(self.sistema.usuarios_registrados) >= MAX_USUARIOS: return messagebox.showerror("Error", "Límite alcanzado.")
             
-            filepath = filedialog.askopenfilename(filetypes=[("Archivos CSV", "*.csv")], title="Seleccionar CSV para Registrar")
+            filepath = filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
             if not filepath: return
             
             sweeps_data = self.read_csv_file(filepath)
             if not sweeps_data: return
-            
-            while len(sweeps_data) < 5:
-                sweeps_data.append(sweeps_data[0])
+            while len(sweeps_data) < 5: sweeps_data.append(sweeps_data[0])
                 
-            metodo_seleccionado = self.model_var.get()
-            sweeps_features = []
-            
-            for freqs, mags, phases in sweeps_data[:5]:
-                feat = calcular_caracteristicas(freqs, mags, phases, metodo_seleccionado)
-                sweeps_features.append(feat)
-                
+            metodo = self.model_var.get()
+            sweeps_features = [calcular_caracteristicas(f, m, p, metodo) for f, m, p in sweeps_data[:5]]
             admin_win.destroy()
             self.process_registration(name, sweeps_features)
             
         def on_identify_csv():
-            if len(self.sistema.usuarios_registrados) == 0:
-                messagebox.showwarning("Atención", "No hay usuarios registrados. Registre primero a alguien.")
-                return
-                
-            filepath = filedialog.askopenfilename(filetypes=[("Archivos CSV", "*.csv")], title="Seleccionar CSV para Identificar")
+            if len(self.sistema.usuarios_registrados) == 0: return messagebox.showwarning("Error", "Base de datos vacía.")
+            filepath = filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
             if not filepath: return
-            
             sweeps_data = self.read_csv_file(filepath)
             if not sweeps_data: return
-            
-            metodo_seleccionado = self.model_var.get()
-            freqs, mags, phases = sweeps_data[0]
-            feat = calcular_caracteristicas(freqs, mags, phases, metodo_seleccionado)
-            
+            feat = calcular_caracteristicas(sweeps_data[0][0], sweeps_data[0][1], sweeps_data[0][2], self.model_var.get())
             admin_win.destroy()
             self.process_identification(feat)
 
-        # Botones de Acción Biometría
-        ttk.Button(admin_win, text="▶ Iniciar Registro (Vivo)", command=on_register).pack(pady=(15, 5), padx=20, fill=tk.X)
-        ttk.Button(admin_win, text="📁 Registrar Usuario desde CSV", command=on_register_csv).pack(pady=5, padx=20, fill=tk.X)
-        ttk.Button(admin_win, text="🔍 Simular Identificación desde CSV", command=on_identify_csv).pack(pady=5, padx=20, fill=tk.X)
+        ttk.Button(admin_win, text="▶ Iniciar Registro (Vivo)", command=on_register).pack(pady=(10, 5), padx=20, fill=tk.X)
+        ttk.Button(admin_win, text="📁 Importar Registro desde CSV", command=on_register_csv).pack(pady=5, padx=20, fill=tk.X)
+        ttk.Button(admin_win, text="🔍 Simular Identificación CSV", command=on_identify_csv).pack(pady=5, padx=20, fill=tk.X)
 
-        # Configuraciones de Sistema
-        ttk.Separator(admin_win, orient='horizontal').pack(fill='x', pady=15, padx=20)
-        ttk.Label(admin_win, text="CONFIGURACIONES DEL SISTEMA", font=("Helvetica", 10, "bold")).pack(pady=5)
-        
-        ttk.Checkbutton(admin_win, text="Auto-guardar archivo CSV después del registro en vivo", variable=self.auto_save_csv).pack(pady=5)
+        # --- CONFIGURACIONES ---
+        ttk.Separator(admin_win, orient='horizontal').pack(fill='x', pady=10, padx=20)
+        ttk.Checkbutton(admin_win, text="Auto-guardar CSV al registrar en vivo", variable=self.auto_save_csv).pack(pady=5)
         
         def on_change_password():
-            new_pwd = simpledialog.askstring("Cambio de Password", "Ingrese la NUEVA contraseña:", show='*')
+            new_pwd = simpledialog.askstring("Password", "NUEVA contraseña:", show='*')
             if new_pwd:
-                confirm_pwd = simpledialog.askstring("Cambio de Password", "Confirme la NUEVA contraseña:", show='*')
-                if new_pwd == confirm_pwd:
+                conf_pwd = simpledialog.askstring("Password", "Confirmar:", show='*')
+                if new_pwd == conf_pwd:
                     update_stored_hash(new_pwd)
-                    messagebox.showinfo("Éxito", "La contraseña de administrador ha sido actualizada.")
-                else:
-                    messagebox.showerror("Error", "Las contraseñas no coinciden. Intente de nuevo.")
+                    messagebox.showinfo("Éxito", "Contraseña actualizada.")
+                else: messagebox.showerror("Error", "No coinciden.")
                     
-        ttk.Button(admin_win, text="Cambiar Contraseña Maestra", command=on_change_password).pack(pady=15)
+        ttk.Button(admin_win, text="Cambiar Contraseña Maestra", command=on_change_password).pack(pady=10)
 
     def on_closing(self):
-        if self.is_connected:
-            self.disconnect_serial()
+        if self.is_connected: self.disconnect_serial()
         self.master.destroy()
         plt.close(self.fig)
 
