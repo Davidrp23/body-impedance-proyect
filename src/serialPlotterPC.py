@@ -335,6 +335,42 @@ class SerialPlotterApp:
 
         self.canvas.draw_idle()
 
+    # --- NUEVA FUNCIÓN PARA LEER ARCHIVOS CSV ---
+    def read_csv_file(self, filepath):
+        sweeps = []
+        try:
+            with open(filepath, 'r') as f:
+                reader = csv.reader(f)
+                header = next(reader, None) # Saltar encabezado
+                freqs, mags, phases = [], [], []
+                for row in reader:
+                    if len(row) >= 3:
+                        try:
+                            f_val = float(row[0])
+                            m_val = float(row[1])
+                            p_val = float(row[2])
+                            freqs.append(f_val)
+                            mags.append(m_val)
+                            phases.append(p_val)
+                        except ValueError:
+                            pass
+                
+                # Agrupar en fragmentos (sweeps) de 48 puntos
+                chunk_size = 48
+                if len(freqs) >= chunk_size:
+                    for i in range(0, len(freqs), chunk_size):
+                        chunk_f = freqs[i:i+chunk_size]
+                        chunk_m = mags[i:i+chunk_size]
+                        chunk_p = phases[i:i+chunk_size]
+                        if len(chunk_f) == chunk_size:
+                            sweeps.append((chunk_f, chunk_m, chunk_p))
+                elif len(freqs) > 0:
+                    sweeps.append((freqs, mags, phases))
+                    
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo leer el archivo CSV:\n{e}")
+        return sweeps
+
     def read_serial_data(self, mode="single", user_name="", metodo_extraccion="Regresión Lineal"):
         num_points = 48
         num_sweeps = 5 if mode == "register" else 1
@@ -486,6 +522,7 @@ class SerialPlotterApp:
         self.bio_result_lbl.config(foreground="green")
         messagebox.showinfo("Registro Exitoso", f"Usuario '{user_name}' registrado exitosamente en la base de datos.")
 
+    # --- PANEL ADMINISTRADOR ACTUALIZADO PARA CSV ---
     def open_admin_panel(self):
         pwd = simpledialog.askstring("Login de Administrador", "Ingrese contraseña de administrador:", show='*')
         if pwd != PASSWORD_ADMIN:
@@ -495,7 +532,7 @@ class SerialPlotterApp:
             
         admin_win = tk.Toplevel(self.master)
         admin_win.title("Panel de Administrador")
-        admin_win.geometry("350x300")
+        admin_win.geometry("400x480") # Tamaño ajustado para nuevos botones
         
         ttk.Label(admin_win, text=f"Usuarios Registrados: {len(self.sistema.usuarios_registrados)}/{MAX_USUARIOS}", font=("Helvetica", 10, "bold")).pack(pady=10)
         
@@ -508,6 +545,7 @@ class SerialPlotterApp:
         name_var = tk.StringVar()
         ttk.Entry(admin_win, textvariable=name_var).pack(padx=20, fill=tk.X)
         
+        # Función original: registro en vivo via puerto serial
         def on_register():
             name = name_var.get().strip()
             if not name:
@@ -523,7 +561,63 @@ class SerialPlotterApp:
             messagebox.showinfo("Registro", f"Se iniciará la recopilación usando: {modelo_actual}.\nMantenga el brazo quieto (5 barridos).")
             self.start_registration(name)
             
-        ttk.Button(admin_win, text="Iniciar Registro (5 barridos)", command=on_register).pack(pady=15)
+        # Nueva función: registro via archivo CSV
+        def on_register_csv():
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showwarning("Atención", "El nombre no puede estar vacío.")
+                return
+            if len(self.sistema.usuarios_registrados) >= MAX_USUARIOS:
+                messagebox.showerror("Error", f"Límite de {MAX_USUARIOS} usuarios alcanzado.")
+                return
+            
+            filepath = filedialog.askopenfilename(filetypes=[("Archivos CSV", "*.csv")], title="Seleccionar CSV para Registrar")
+            if not filepath: return
+            
+            sweeps_data = self.read_csv_file(filepath)
+            if not sweeps_data: return
+            
+            # Si el CSV tiene solo 1 barrido, lo duplicamos hasta 5 para estabilizar el modelo
+            while len(sweeps_data) < 5:
+                sweeps_data.append(sweeps_data[0])
+                
+            metodo_seleccionado = self.model_var.get()
+            sweeps_features = []
+            
+            for freqs, mags, phases in sweeps_data[:5]:
+                feat = calcular_caracteristicas(freqs, mags, phases, metodo_seleccionado)
+                sweeps_features.append(feat)
+                
+            admin_win.destroy()
+            self.process_registration(name, sweeps_features)
+            
+        # Nueva función: simulador de identificación via archivo CSV
+        def on_identify_csv():
+            if len(self.sistema.usuarios_registrados) == 0:
+                messagebox.showwarning("Atención", "No hay usuarios registrados. Registre primero a alguien.")
+                return
+                
+            filepath = filedialog.askopenfilename(filetypes=[("Archivos CSV", "*.csv")], title="Seleccionar CSV para Identificar")
+            if not filepath: return
+            
+            sweeps_data = self.read_csv_file(filepath)
+            if not sweeps_data: return
+            
+            metodo_seleccionado = self.model_var.get()
+            
+            # Para identificar solo tomamos el primer barrido encontrado en el CSV
+            freqs, mags, phases = sweeps_data[0]
+            feat = calcular_caracteristicas(freqs, mags, phases, metodo_seleccionado)
+            
+            admin_win.destroy()
+            self.process_identification(feat)
+            
+        ttk.Button(admin_win, text="▶ Iniciar Registro (Vivo)", command=on_register).pack(pady=(15, 5))
+        ttk.Button(admin_win, text="📁 Registrar Usuario desde CSV", command=on_register_csv).pack(pady=5)
+        
+        ttk.Separator(admin_win, orient='horizontal').pack(fill='x', pady=10, padx=20)
+        
+        ttk.Button(admin_win, text="🔍 Simular Identificación desde CSV", command=on_identify_csv).pack(pady=5)
 
     def on_closing(self):
         if self.is_connected:
