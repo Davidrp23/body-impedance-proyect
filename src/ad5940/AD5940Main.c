@@ -93,7 +93,7 @@ void AD5940PlatformCfg(void)
   clk_cfg.ADCCLkSrc = ADCCLKSRC_HFOSC;
   clk_cfg.SysClkDiv = SYSCLKDIV_1;
   clk_cfg.SysClkSrc = SYSCLKSRC_HFOSC;
-  clk_cfg.HfOSC32MHzMode = bTRUE;   /* 32 MHz HFOSC required for HP mode (sweep to 198 kHz) */
+  clk_cfg.HfOSC32MHzMode = bFALSE;   /* 32 MHz HFOSC required for HP mode (sweep to 198 kHz) */
   clk_cfg.HFOSCEn = bTRUE;
   clk_cfg.HFXTALEn = bFALSE;
   clk_cfg.LFOSCEn = bTRUE;
@@ -196,6 +196,7 @@ void AD5940_Main(void)
     }
     k_usleep(100);
   }
+  printk("END_SWEEP\n");
   BIAend = 0;
   //printk("\n=== Sweep complete ===\n");
   AD5940_ShutDownS();
