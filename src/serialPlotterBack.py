@@ -5,6 +5,7 @@ import serial.tools.list_ports
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import numpy as np
+from sklearn.naive_bayes import GaussianNB
 import threading
 import time
 import csv
@@ -19,86 +20,61 @@ def calcular_caracteristicas(frecuencias, magnitudes, fases):
     frecuencias = np.array(frecuencias)
     magnitudes = np.array(magnitudes)
     fases = np.array(fases)
-    
+
     # Cálculo de Resistencia (R) y Reactancia (X) a partir de los datos polares
     R = magnitudes * np.cos(fases)
     X = magnitudes * np.sin(fases)
-    
+
     max_mag = np.max(magnitudes)
-    
+
     # Espacio log-log (usamos abs() para evitar errores matemáticos con reactancia negativa)
     log_freq = np.log10(frecuencias)
     log_mag = np.log10(magnitudes)
     log_R = np.log10(np.abs(R))
     log_X = np.log10(np.abs(X))
-    
+
     # Ajuste lineal (regresión)
     slope_mag, int_mag = np.polyfit(log_freq, log_mag, 1)
     slope_R, int_R = np.polyfit(log_freq, log_R, 1)
     slope_X, int_X = np.polyfit(log_freq, log_X, 1)
-    
+
     return [max_mag, slope_mag, int_mag, slope_R, int_R, slope_X, int_X]
 
 class SistemaBiometrico:
     def __init__(self):
-        self.usuarios_registrados = {} 
+        self.modelo_nb = GaussianNB()
+        self.usuarios_registrados = {}
         self.dataset_features = []
         self.dataset_labels = []
         self.modelo_entrenado = False
 
     def entrenar_modelo(self):
         if len(self.usuarios_registrados) > 0:
+            self.modelo_nb.fit(self.dataset_features, self.dataset_labels)
             self.modelo_entrenado = True
 
     def agregar_usuario(self, nombre, features_list):
         nuevo_id = len(self.usuarios_registrados)
         self.usuarios_registrados[nuevo_id] = nombre
-        
+
         for features in features_list:
             self.dataset_features.append(features)
             self.dataset_labels.append(nuevo_id)
-            
+
         self.entrenar_modelo()
 
     def identificar_usuario(self, features_desconocidas):
         if not self.modelo_entrenado:
             return False, "Sistema no configurado.", 0.0
 
-        features = np.array(features_desconocidas)
-        mejor_id = None
-        mejor_similitud = 0.0
-        
-        # Comparamos la lectura contra el perfil de cada usuario
-        for uid in self.usuarios_registrados:
-            # Extraemos los 5 barridos de calibración de este usuario
-            indices = [i for i, label in enumerate(self.dataset_labels) if label == uid]
-            user_sweeps = np.array([self.dataset_features[i] for i in indices])
-            
-            # Calculamos su media y su rango de variación habitual
-            media = np.mean(user_sweeps, axis=0)
-            rango = np.max(user_sweeps, axis=0) - np.min(user_sweeps, axis=0)
-            
-            # Damos un margen de tolerancia (mínimo un 5% de variación admitida)
-            margen = np.maximum(rango, np.abs(media) * 0.05)
-            margen = np.where(margen == 0, 1e-6, margen) # Prevención por si la media es 0
-            
-            # Evaluamos cuántas veces supera el margen de error normal
-            desviaciones = np.abs(features - media) / margen
-            error_medio = np.mean(desviaciones)
-            
-            # Convertimos el error a porcentaje de confianza (0 error = 100% similitud)
-            # Con este ajuste, un error normal límite dará aprox ~85%
-            similitud = np.exp(-0.16 * error_medio)
-            
-            if similitud > mejor_similitud:
-                mejor_similitud = similitud
-                mejor_id = uid
+        probabilidad = self.modelo_nb.predict_proba([features_desconocidas])[0]
+        max_prob = np.max(probabilidad)
+        id_estimado = np.argmax(probabilidad)
 
-        if mejor_similitud >= UMBRAL_CONFIANZA:
-            return True, f"Bienvenido, {self.usuarios_registrados[mejor_id]}", mejor_similitud
+        if max_prob >= UMBRAL_CONFIANZA:
+            return True, f"Bienvenido, {self.usuarios_registrados[id_estimado]}", max_prob
         else:
-            candidato = self.usuarios_registrados[mejor_id] if mejor_id is not None else "N/A"
-            return False, f"Acceso denegado (Intento: {candidato})", mejor_similitud
+            return False, "Acceso denegado", max_prob
 
 class SerialPlotterApp:
     def __init__(self, master):
@@ -109,7 +85,7 @@ class SerialPlotterApp:
         self.is_connected = False
         self.read_thread = None
         self.stop_event = threading.Event()
-        
+
         self.sistema = SistemaBiometrico()
 
         # Data storage for plotting
@@ -157,7 +133,7 @@ class SerialPlotterApp:
         # Command Frame
         command_frame = ttk.LabelFrame(control_frame, text="Acquisition & Data", padding="10")
         command_frame.pack(side=tk.LEFT, fill="both", expand=True, padx=(5, 0))
-        
+
         command_frame.columnconfigure(0, weight=1)
         command_frame.columnconfigure(1, weight=1)
         command_frame.columnconfigure(2, weight=1)
@@ -202,9 +178,9 @@ class SerialPlotterApp:
         ports = serial.tools.list_ports.comports()
         # Esto creará una lista con el nombre del puerto (ej. /dev/ttyACM0)
         port_list = [port.device for port in ports]
-        
+
         self.port_combobox['values'] = port_list
-        
+
         if port_list:
             # Intentar seleccionar automáticamente el que parece un Arduino
             arduino_port = next((p for p in port_list if "ACM" in p or "USB" in p), port_list[0])
@@ -262,10 +238,10 @@ class SerialPlotterApp:
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
         self.canvas_widget = self.canvas.get_tk_widget()
         self.canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        
+
         self.toolbar = NavigationToolbar2Tk(self.canvas, self.plot_frame)
         self.toolbar.update()
-        
+
         self.canvas.draw()
 
     def update_plot(self):
@@ -322,16 +298,16 @@ class SerialPlotterApp:
                                 wrapped_phase = ((data[2] + 180) % 360) - 180
                                 self.phases.append(wrapped_phase)
                                 received_points += 1
-                                
+
                                 # Actualización de gráfica en tiempo real (cada 4 puntos para evitar lag)
                                 if received_points % 4 == 0:
                                     self.master.after(0, self.update_plot)
                         except ValueError:
                             print(f"Skipping malformed line: {line}")
-                
+
                 # Actualización final para garantizar graficar el último punto del barrido
                 self.master.after(0, self.update_plot)
-                
+
                 if received_points > 0 and not self.stop_event.is_set():
                     features = calcular_caracteristicas(self.frequencies, self.magnitudes, self.phases)
                     sweeps_features.append(features)
@@ -351,7 +327,7 @@ class SerialPlotterApp:
                     self.set_status(f"Acquisition complete. {received_points} points received.")
             else:
                 self.set_status("Acquisition stopped.")
-            
+
         except serial.SerialException as e:
             messagebox.showerror("Serial Read Error", str(e))
             self.set_status("Serial Read Error.")
@@ -438,22 +414,22 @@ class SerialPlotterApp:
             if pwd is not None:
                 messagebox.showerror("Error", "Contraseña incorrecta")
             return
-            
+
         admin_win = tk.Toplevel(self.master)
         admin_win.title("Panel de Administrador")
         admin_win.geometry("350x300")
-        
+
         ttk.Label(admin_win, text=f"Usuarios Registrados: {len(self.sistema.usuarios_registrados)}/{MAX_USUARIOS}", font=("Helvetica", 10, "bold")).pack(pady=10)
-        
+
         listbox = tk.Listbox(admin_win, height=5)
         for uid, unombre in self.sistema.usuarios_registrados.items():
             listbox.insert(tk.END, f"ID {uid}: {unombre}")
         listbox.pack(fill=tk.BOTH, padx=20, pady=5)
-        
+
         ttk.Label(admin_win, text="Nombre del nuevo usuario:").pack(pady=5)
         name_var = tk.StringVar()
         ttk.Entry(admin_win, textvariable=name_var).pack(padx=20, fill=tk.X)
-        
+
         def on_register():
             name = name_var.get().strip()
             if not name:
@@ -462,11 +438,11 @@ class SerialPlotterApp:
             if len(self.sistema.usuarios_registrados) >= MAX_USUARIOS:
                 messagebox.showerror("Error", f"Límite de {MAX_USUARIOS} usuarios alcanzado.")
                 return
-            
+
             admin_win.destroy()
             messagebox.showinfo("Registro", "Se iniciará la recopilación de 5 mediciones. Mantenga el brazo quieto.")
             self.start_registration(name)
-            
+
         ttk.Button(admin_win, text="Iniciar Registro (5 barridos)", command=on_register).pack(pady=15)
 
     def on_closing(self):

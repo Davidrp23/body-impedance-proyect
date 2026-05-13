@@ -32,14 +32,14 @@ AppBIACfg_Type AppBIACfg =
   .MaxSeqLenCal = 0,
 
   .ReDoRtiaCal = bFALSE,
-  .SysClkFreq = 32000000.0,  /* HP mode: HFOSC runs at 32 MHz */
+  .SysClkFreq = 16000000.0,  /* HP mode: HFOSC runs at 16 MHz */
   .WuptClkFreq = 32000.0,
-  .AdcClkFreq = 32000000.0,  /* HP mode: ADC runs at 32 MHz (with ADCRATE_1P6MHZ) */
+  .AdcClkFreq = 16000000.0,  /* HP mode: ADC runs at 16 MHz (with ADCRATE_1P6MHZ) */
   .BiaODR = 20.0, /* 20.0 Hz*/
   .NumOfData = DEFAULT_SWEEP_POINTS, /* DEFAULT_SWEEP_POINTS = 1 barrido completo, -1 = never stop */
   .RcalVal = 10000.0, /* 10 kOhm - overridden at init by cfgRcalVal */
 
-  .PwrMod = AFEPWR_HP,  /* HP mode required for excitation >80 kHz */
+  .PwrMod = AFEPWR_LP,  /* HP mode required for excitation >80 kHz */
   .HstiaRtiaSel = HSTIARTIA_1K,
   .CtiaSel = 16,
   .ExcitBufGain = EXCITBUFGAIN_2,
@@ -247,7 +247,7 @@ static AD5940Err AppBIASeqCfgGen(void)
   memset(&dsp_cfg.ADCDigCompCfg, 0, sizeof(dsp_cfg.ADCDigCompCfg));
   
   dsp_cfg.ADCFilterCfg.ADCAvgNum = ADCAVGNUM_16;  /* Don't care because it's disabled */
-  dsp_cfg.ADCFilterCfg.ADCRate = ADCRATE_1P6MHZ; /* HP mode: ADC runs at 1.6 MSPS */
+  dsp_cfg.ADCFilterCfg.ADCRate = ADCRATE_800KHZ; /* HP mode: ADC runs at 1.6 MSPS */
   dsp_cfg.ADCFilterCfg.ADCSinc2Osr = AppBIACfg.ADCSinc2Osr;
   dsp_cfg.ADCFilterCfg.ADCSinc3Osr = AppBIACfg.ADCSinc3Osr;
   dsp_cfg.ADCFilterCfg.BpSinc3 = bFALSE;

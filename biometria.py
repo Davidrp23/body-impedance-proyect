@@ -5,7 +5,7 @@ import getpass
 import time
 
 # --- CONFIGURACIONES GLOBALES ---
-PUERTO_SERIAL = 'COM3'  # Cambiar por el puerto correcto (ej. /dev/ttyACM0 en Mac/Linux)
+PUERTO_SERIAL = '/dev/ttyACM1'  # Cambiar por el puerto correcto (ej. /dev/ttyACM0 en Mac/Linux)
 BAUD_RATE = 115200      # Debe coincidir con la placa Nordic
 PASSWORD_ADMIN = "nordic123"
 MAX_USUARIOS = 5        # Límite máximo para mantener alta precisión
@@ -41,7 +41,7 @@ def iniciar_y_leer_barrido(ser):
     Envía el comando de inicio ('S') a la placa y luego lee los datos.
     """
     # 1. SINCRONIZACIÓN: Envía la letra 'S' a la placa Nordic para que inicie la medición
-    ser.write(b'S')
+    ser.write(b'send\n')
     ser.flush()
     
     frecuencias, magnitudes, fases = [], [], []
