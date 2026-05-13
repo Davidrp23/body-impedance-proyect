@@ -8,6 +8,7 @@ import numpy as np
 import threading
 import time
 import csv
+from scipy.optimize import least_squares
 
 # --- CONFIGURACIONES GLOBALES BIOMETRÍA ---
 PASSWORD_ADMIN = "nordic123"
@@ -15,24 +16,74 @@ MAX_USUARIOS = 5
 UMBRAL_CONFIANZA = 0.85
 
 # --- FUNCIONES DE EXTRACCIÓN Y SISTEMA BIOMÉTRICO ---
-def calcular_caracteristicas(frecuencias, magnitudes, fases):
+
+def fit_cole_model_ideal(frecuencias, magnitudes, fases):
+    """
+    Ajusta los datos al modelo ideal (Debye) donde alfa = 1.
+    Retorna los parámetros estables: [R0, Rinf, fc]
+    """
+    f = np.array(frecuencias)
+    mag = np.array(magnitudes)
+    fases_rad = np.radians(np.array(fases))
+    
+    Z_real_data = mag * np.cos(fases_rad)
+    Z_imag_data = mag * np.sin(fases_rad)
+    
+    def residual(params):
+        R0, Rinf, fc = params
+        
+        if fc <= 0:
+            return np.ones(2 * len(f)) * 1e6
+            
+        omega_ratio = f / fc
+        
+        # Al forzar alfa=1, la fórmula compleja se simplifica drásticamente:
+        # a = 1, b = omega_ratio
+        den = 1 + omega_ratio**2
+        
+        Z_model_real = Rinf + (R0 - Rinf) / den
+        Z_model_imag = -(R0 - Rinf) * omega_ratio / den
+        
+        return np.concatenate((Z_model_real - Z_real_data, Z_model_imag - Z_imag_data))
+        
+    # Estimaciones iniciales
+    R0_guess = mag[0] if len(mag) > 0 else 1000.0
+    Rinf_guess = mag[-1] if len(mag) > 0 else 100.0
+    fc_guess = 50000.0  # 50 kHz típico
+    
+    p0 = [R0_guess, Rinf_guess, fc_guess]
+    
+    # Límites para los 3 parámetros: R0>0, Rinf>0, fc>1Hz
+    bounds = (
+        [0, 0, 1.0], 
+        [np.inf, np.inf, 1e7]
+    )
+    
+    try:
+        res = least_squares(residual, p0, bounds=bounds, method='trf')
+        return list(res.x)
+    except Exception as e:
+        print(f"Error ajustando el modelo: {e}")
+        return p0
+
+def calcular_caracteristicas(frecuencias, magnitudes, fases, metodo="Regresión Lineal"):
+    if metodo == "Cole-Cole (Ideal)":
+        return fit_cole_model_ideal(frecuencias, magnitudes, fases)
+        
+    # Método original
     frecuencias = np.array(frecuencias)
     magnitudes = np.array(magnitudes)
     fases = np.array(fases)
     
-    # Cálculo de Resistencia (R) y Reactancia (X) a partir de los datos polares
     R = magnitudes * np.cos(fases)
     X = magnitudes * np.sin(fases)
-    
     max_mag = np.max(magnitudes)
     
-    # Espacio log-log (usamos abs() para evitar errores matemáticos con reactancia negativa)
     log_freq = np.log10(frecuencias)
     log_mag = np.log10(magnitudes)
     log_R = np.log10(np.abs(R))
     log_X = np.log10(np.abs(X))
     
-    # Ajuste lineal (regresión)
     slope_mag, int_mag = np.polyfit(log_freq, log_mag, 1)
     slope_R, int_R = np.polyfit(log_freq, log_R, 1)
     slope_X, int_X = np.polyfit(log_freq, log_X, 1)
@@ -68,31 +119,30 @@ class SistemaBiometrico:
         mejor_id = None
         mejor_similitud = 0.0
         
-        # Comparamos la lectura contra el perfil de cada usuario
         for uid in self.usuarios_registrados:
-            # Extraemos los 5 barridos de calibración de este usuario
             indices = [i for i, label in enumerate(self.dataset_labels) if label == uid]
             user_sweeps = np.array([self.dataset_features[i] for i in indices])
             
-            # Calculamos su media y su rango de variación habitual
+            if user_sweeps.shape[1] != features.shape[0]:
+                continue
+                
             media = np.mean(user_sweeps, axis=0)
             rango = np.max(user_sweeps, axis=0) - np.min(user_sweeps, axis=0)
             
-            # Damos un margen de tolerancia (mínimo un 5% de variación admitida)
             margen = np.maximum(rango, np.abs(media) * 0.05)
-            margen = np.where(margen == 0, 1e-6, margen) # Prevención por si la media es 0
+            margen = np.where(margen == 0, 1e-6, margen)
             
-            # Evaluamos cuántas veces supera el margen de error normal
             desviaciones = np.abs(features - media) / margen
             error_medio = np.mean(desviaciones)
             
-            # Convertimos el error a porcentaje de confianza (0 error = 100% similitud)
-            # Con este ajuste, un error normal límite dará aprox ~85%
             similitud = np.exp(-0.16 * error_medio)
             
             if similitud > mejor_similitud:
                 mejor_similitud = similitud
                 mejor_id = uid
+
+        if mejor_id is None:
+            return False, "Error dimensional (Cambio de modelo)", 0.0
 
         if mejor_similitud >= UMBRAL_CONFIANZA:
             return True, f"Bienvenido, {self.usuarios_registrados[mejor_id]}", mejor_similitud
@@ -103,7 +153,7 @@ class SistemaBiometrico:
 class SerialPlotterApp:
     def __init__(self, master):
         self.master = master
-        master.title("AD5940 Serial Plotter")
+        master.title("Ploteador Serial AD5940")
 
         self.serial_port = None
         self.is_connected = False
@@ -112,80 +162,86 @@ class SerialPlotterApp:
         
         self.sistema = SistemaBiometrico()
 
-        # Data storage for plotting
         self.frequencies = []
         self.magnitudes = []
         self.phases = []
 
-        # --- GUI Elements ---
         self.create_widgets()
         self.setup_plot()
 
     def create_widgets(self):
-        # Set theme if available
         style = ttk.Style()
         if 'clam' in style.theme_names():
             style.theme_use('clam')
 
-        self.status_var = tk.StringVar(value="Ready")
+        self.status_var = tk.StringVar(value="Listo")
 
-        # Top Control Frame
         control_frame = ttk.Frame(self.master, padding="10")
         control_frame.pack(side=tk.TOP, fill="x")
 
-        # Serial Port Configuration Frame
-        serial_frame = ttk.LabelFrame(control_frame, text="Serial Connection", padding="10")
+        # Serial Frame
+        serial_frame = ttk.LabelFrame(control_frame, text="Conexión Serial", padding="10")
         serial_frame.pack(side=tk.LEFT, fill="y", padx=(0, 5))
 
-        ttk.Label(serial_frame, text="Port:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        ttk.Label(serial_frame, text="Puerto:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
         self.port_combobox = ttk.Combobox(serial_frame, width=20)
         self.port_combobox.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         self.refresh_ports()
-        ttk.Button(serial_frame, text="↻ Refresh", command=self.refresh_ports, width=10).grid(row=0, column=2, padx=5, pady=5)
+        ttk.Button(serial_frame, text="↻ Actualizar", command=self.refresh_ports, width=12).grid(row=0, column=2, padx=5, pady=5)
 
-        ttk.Label(serial_frame, text="Baud Rate:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        ttk.Label(serial_frame, text="Tasa de Baudios:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
         self.baud_rate_entry = ttk.Entry(serial_frame, width=20)
-        self.baud_rate_entry.insert(0, "115200") # Default baud rate
+        self.baud_rate_entry.insert(0, "115200")
         self.baud_rate_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
 
-        self.connect_button = ttk.Button(serial_frame, text="Connect", command=self.connect_serial)
+        self.connect_button = ttk.Button(serial_frame, text="Conectar", command=self.connect_serial)
         self.connect_button.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
 
-        self.disconnect_button = ttk.Button(serial_frame, text="Disconnect", command=self.disconnect_serial, state=tk.DISABLED)
+        self.disconnect_button = ttk.Button(serial_frame, text="Desconectar", command=self.disconnect_serial, state=tk.DISABLED)
         self.disconnect_button.grid(row=2, column=2, padx=5, pady=5, sticky="ew")
 
         # Command Frame
-        command_frame = ttk.LabelFrame(control_frame, text="Acquisition & Data", padding="10")
+        command_frame = ttk.LabelFrame(control_frame, text="Adquisición y Datos", padding="10")
         command_frame.pack(side=tk.LEFT, fill="both", expand=True, padx=(5, 0))
         
         command_frame.columnconfigure(0, weight=1)
         command_frame.columnconfigure(1, weight=1)
         command_frame.columnconfigure(2, weight=1)
 
-        self.send_button = ttk.Button(command_frame, text="▶ Start Acquisition", command=self.start_acquisition, state=tk.DISABLED)
+        self.send_button = ttk.Button(command_frame, text="▶ Iniciar Adquisición", command=self.start_acquisition, state=tk.DISABLED)
         self.send_button.grid(row=0, column=0, padx=5, pady=10, sticky="nsew")
 
-        self.clear_button = ttk.Button(command_frame, text="✖ Clear Plot", command=self.clear_data)
+        self.clear_button = ttk.Button(command_frame, text="✖ Limpiar Gráfica", command=self.clear_data)
         self.clear_button.grid(row=0, column=1, padx=5, pady=10, sticky="nsew")
 
-        self.save_button = ttk.Button(command_frame, text="💾 Save CSV", command=self.save_data)
+        self.save_button = ttk.Button(command_frame, text="💾 Guardar CSV", command=self.save_data)
         self.save_button.grid(row=0, column=2, padx=5, pady=10, sticky="nsew")
 
         # Biometrics Frame
-        bio_frame = ttk.LabelFrame(control_frame, text="Biometrics", padding="10")
+        bio_frame = ttk.LabelFrame(control_frame, text="Biometría", padding="10")
         bio_frame.pack(side=tk.LEFT, fill="both", expand=True, padx=(5, 0))
         bio_frame.columnconfigure(0, weight=1)
         bio_frame.columnconfigure(1, weight=1)
 
-        self.identify_btn = ttk.Button(bio_frame, text="👤 Identify User", command=self.start_identification, state=tk.DISABLED)
+        self.identify_btn = ttk.Button(bio_frame, text="👤 Identificar Usuario", command=self.start_identification, state=tk.DISABLED)
         self.identify_btn.grid(row=0, column=0, padx=5, pady=2, sticky="nsew")
 
-        self.admin_btn = ttk.Button(bio_frame, text="⚙️ Admin Panel", command=self.open_admin_panel)
+        self.admin_btn = ttk.Button(bio_frame, text="⚙️ Panel Admin", command=self.open_admin_panel)
         self.admin_btn.grid(row=0, column=1, padx=5, pady=2, sticky="nsew")
+
+        model_subframe = ttk.Frame(bio_frame)
+        model_subframe.grid(row=1, column=0, columnspan=2, pady=5)
+        
+        ttk.Label(model_subframe, text="Modelo:").pack(side=tk.LEFT, padx=(0, 5))
+        self.model_var = tk.StringVar(value="Regresión Lineal")
+        self.model_combo = ttk.Combobox(model_subframe, textvariable=self.model_var, 
+                                        values=["Regresión Lineal", "Cole-Cole (Ideal)"], 
+                                        state="readonly", width=18)
+        self.model_combo.pack(side=tk.LEFT)
 
         self.bio_result_var = tk.StringVar(value="Esperando...")
         self.bio_result_lbl = ttk.Label(bio_frame, textvariable=self.bio_result_var, font=("Helvetica", 10, "bold"))
-        self.bio_result_lbl.grid(row=1, column=0, columnspan=2, pady=5)
+        self.bio_result_lbl.grid(row=2, column=0, columnspan=2, pady=5)
 
         # Plot Frame
         self.plot_frame = ttk.Frame(self.master, padding="10")
@@ -200,13 +256,10 @@ class SerialPlotterApp:
 
     def refresh_ports(self):
         ports = serial.tools.list_ports.comports()
-        # Esto creará una lista con el nombre del puerto (ej. /dev/ttyACM0)
         port_list = [port.device for port in ports]
-        
         self.port_combobox['values'] = port_list
         
         if port_list:
-            # Intentar seleccionar automáticamente el que parece un Arduino
             arduino_port = next((p for p in port_list if "ACM" in p or "USB" in p), port_list[0])
             self.port_combobox.set(arduino_port)
         else:
@@ -222,39 +275,39 @@ class SerialPlotterApp:
             self.disconnect_button.config(state=tk.NORMAL)
             self.send_button.config(state=tk.NORMAL)
             self.identify_btn.config(state=tk.NORMAL)
-            self.set_status(f"Connected to {port} at {baud_rate} bps")
+            self.set_status(f"Conectado a {port} a {baud_rate} bps")
         except Exception as e:
-            messagebox.showerror("Serial Connection Error", str(e))
-            self.set_status("Connection failed.")
+            messagebox.showerror("Error de Conexión Serial", str(e))
+            self.set_status("La conexión falló.")
             self.is_connected = False
 
     def disconnect_serial(self):
         if self.serial_port and self.serial_port.is_open:
-            self.stop_event.set() # Signal the thread to stop if it's running
+            self.stop_event.set()
             if self.read_thread and self.read_thread.is_alive():
-                self.read_thread.join(timeout=2) # Wait for thread to finish
+                self.read_thread.join(timeout=2)
             self.serial_port.close()
             self.is_connected = False
             self.connect_button.config(state=tk.NORMAL)
             self.disconnect_button.config(state=tk.DISABLED)
             self.send_button.config(state=tk.DISABLED)
             self.identify_btn.config(state=tk.DISABLED)
-            self.set_status("Disconnected from serial port.")
+            self.set_status("Desconectado del puerto serial.")
 
     def setup_plot(self):
         self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(8, 6))
-        self.fig.suptitle("AD5940 BIA Data", fontsize=14, fontweight='bold')
+        self.fig.suptitle("Datos BIA AD5940", fontsize=14, fontweight='bold')
         self.fig.tight_layout(pad=3.0)
 
-        self.line_mag, = self.ax1.plot([], [], 'r-o', label='Magnitude (Ohm)', linewidth=2, markersize=4)
-        self.ax1.set_ylabel('Magnitude (Ohm)', fontweight='bold')
+        self.line_mag, = self.ax1.plot([], [], 'r-o', label='Magnitud (Ohm)', linewidth=2, markersize=4)
+        self.ax1.set_ylabel('Magnitud (Ohm)', fontweight='bold')
         self.ax1.set_xscale('log')
         self.ax1.grid(True, which="both", ls="--", alpha=0.5)
         self.ax1.legend()
 
-        self.line_phase, = self.ax2.plot([], [], 'b-o', label='Phase (deg)', linewidth=2, markersize=4)
-        self.ax2.set_xlabel('Frequency (Hz)', fontweight='bold')
-        self.ax2.set_ylabel('Phase (deg)', fontweight='bold')
+        self.line_phase, = self.ax2.plot([], [], 'b-o', label='Fase (grados)', linewidth=2, markersize=4)
+        self.ax2.set_xlabel('Frecuencia (Hz)', fontweight='bold')
+        self.ax2.set_ylabel('Fase (grados)', fontweight='bold')
         self.ax2.set_xscale('log')
         self.ax2.grid(True, which="both", ls="--", alpha=0.5)
         self.ax2.legend()
@@ -272,7 +325,6 @@ class SerialPlotterApp:
         self.line_mag.set_data(self.frequencies, self.magnitudes)
         self.line_phase.set_data(self.frequencies, self.phases)
 
-        # Autoscale axes based on new data
         if self.frequencies:
             self.ax1.relim()
             self.ax1.autoscale_view()
@@ -283,7 +335,7 @@ class SerialPlotterApp:
 
         self.canvas.draw_idle()
 
-    def read_serial_data(self, mode="single", user_name=""):
+    def read_serial_data(self, mode="single", user_name="", metodo_extraccion="Regresión Lineal"):
         num_points = 48
         num_sweeps = 5 if mode == "register" else 1
         sweeps_features = []
@@ -296,9 +348,9 @@ class SerialPlotterApp:
                     break
 
                 if mode == "register":
-                    self.set_status(f"Acquiring sweep {sweep+1}/{num_sweeps}...")
+                    self.set_status(f"Adquiriendo barrido {sweep+1}/{num_sweeps}...")
                 else:
-                    self.set_status("Acquiring data...")
+                    self.set_status("Adquiriendo datos...")
 
                 self.frequencies = []
                 self.magnitudes = []
@@ -323,17 +375,15 @@ class SerialPlotterApp:
                                 self.phases.append(wrapped_phase)
                                 received_points += 1
                                 
-                                # Actualización de gráfica en tiempo real (cada 4 puntos para evitar lag)
                                 if received_points % 4 == 0:
                                     self.master.after(0, self.update_plot)
                         except ValueError:
-                            print(f"Skipping malformed line: {line}")
+                            pass # Ignorar líneas corruptas sin imprimir
                 
-                # Actualización final para garantizar graficar el último punto del barrido
                 self.master.after(0, self.update_plot)
                 
                 if received_points > 0 and not self.stop_event.is_set():
-                    features = calcular_caracteristicas(self.frequencies, self.magnitudes, self.phases)
+                    features = calcular_caracteristicas(self.frequencies, self.magnitudes, self.phases, metodo_extraccion)
                     sweeps_features.append(features)
 
                 if sweep < num_sweeps - 1 and not self.stop_event.is_set():
@@ -348,17 +398,17 @@ class SerialPlotterApp:
                     else:
                         self.set_status("Registro incompleto.")
                 else:
-                    self.set_status(f"Acquisition complete. {received_points} points received.")
+                    self.set_status(f"Adquisición completada. {received_points} puntos recibidos.")
             else:
-                self.set_status("Acquisition stopped.")
+                self.set_status("Adquisición detenida.")
             
         except serial.SerialException as e:
-            messagebox.showerror("Serial Read Error", str(e))
-            self.set_status("Serial Read Error.")
+            messagebox.showerror("Error de Lectura Serial", str(e))
+            self.set_status("Error de Lectura Serial.")
             self.master.after(0, self.disconnect_serial)
         except Exception as e:
             messagebox.showerror("Error", str(e))
-            self.set_status("Error during acquisition.")
+            self.set_status("Error durante la adquisición.")
         finally:
             self.master.after(0, self.enable_buttons)
 
@@ -367,28 +417,28 @@ class SerialPlotterApp:
         self.magnitudes = []
         self.phases = []
         self.update_plot()
-        self.set_status("Plot cleared.")
+        self.set_status("Gráfica limpiada.")
 
     def save_data(self):
         if not self.frequencies:
-            messagebox.showwarning("No Data", "There is no data to save.")
+            messagebox.showwarning("Sin Datos", "No hay datos para guardar.")
             return
         filepath = filedialog.asksaveasfilename(
             defaultextension=".csv",
-            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
-            title="Save BIA Data"
+            filetypes=[("Archivos CSV", "*.csv"), ("Todos los Archivos", "*.*")],
+            title="Guardar Datos BIA"
         )
         if filepath:
             try:
                 with open(filepath, 'w', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow(["Frequency (Hz)", "Magnitude (Ohm)", "Phase (deg)"])
+                    writer.writerow(["Frecuencia (Hz)", "Magnitud (Ohm)", "Fase (grados)"])
                     for freq, mag, phase in zip(self.frequencies, self.magnitudes, self.phases):
                         writer.writerow([freq, mag, phase])
-                self.set_status(f"Data successfully saved to {filepath}")
+                self.set_status(f"Datos guardados exitosamente en {filepath}")
             except Exception as e:
-                messagebox.showerror("Error Saving File", str(e))
-                self.set_status("Failed to save data.")
+                messagebox.showerror("Error al Guardar Archivo", str(e))
+                self.set_status("Error al guardar los datos.")
 
     def start_acquisition(self):
         self.start_acquisition_task("single")
@@ -401,21 +451,25 @@ class SerialPlotterApp:
 
     def start_acquisition_task(self, mode="single", user_name=""):
         if not self.is_connected:
-            messagebox.showwarning("Not Connected", "Please connect to a serial port first.")
+            messagebox.showwarning("No Conectado", "Por favor, conéctese a un puerto serial primero.")
             return
 
-        self.stop_event.clear() # Clear stop event for new acquisition
-        self.read_thread = threading.Thread(target=self.read_serial_data, args=(mode, user_name))
-        self.read_thread.daemon = True # Allow the main program to exit even if thread is running
+        metodo_seleccionado = self.model_var.get()
+
+        self.stop_event.clear()
+        self.read_thread = threading.Thread(target=self.read_serial_data, args=(mode, user_name, metodo_seleccionado))
+        self.read_thread.daemon = True
         self.read_thread.start()
 
     def disable_buttons(self):
         self.send_button.config(state=tk.DISABLED)
         self.identify_btn.config(state=tk.DISABLED)
         self.admin_btn.config(state=tk.DISABLED)
+        self.model_combo.config(state=tk.DISABLED)
 
     def enable_buttons(self):
         self.admin_btn.config(state=tk.NORMAL)
+        self.model_combo.config(state="readonly")
         if self.is_connected:
             self.send_button.config(state=tk.NORMAL)
             self.identify_btn.config(state=tk.NORMAL)
@@ -433,7 +487,7 @@ class SerialPlotterApp:
         messagebox.showinfo("Registro Exitoso", f"Usuario '{user_name}' registrado exitosamente en la base de datos.")
 
     def open_admin_panel(self):
-        pwd = simpledialog.askstring("Admin Login", "Ingrese contraseña de administrador:", show='*')
+        pwd = simpledialog.askstring("Login de Administrador", "Ingrese contraseña de administrador:", show='*')
         if pwd != PASSWORD_ADMIN:
             if pwd is not None:
                 messagebox.showerror("Error", "Contraseña incorrecta")
@@ -464,7 +518,9 @@ class SerialPlotterApp:
                 return
             
             admin_win.destroy()
-            messagebox.showinfo("Registro", "Se iniciará la recopilación de 5 mediciones. Mantenga el brazo quieto.")
+            
+            modelo_actual = self.model_var.get()
+            messagebox.showinfo("Registro", f"Se iniciará la recopilación usando: {modelo_actual}.\nMantenga el brazo quieto (5 barridos).")
             self.start_registration(name)
             
         ttk.Button(admin_win, text="Iniciar Registro (5 barridos)", command=on_register).pack(pady=15)
@@ -473,7 +529,7 @@ class SerialPlotterApp:
         if self.is_connected:
             self.disconnect_serial()
         self.master.destroy()
-        plt.close(self.fig) # Close the matplotlib figure
+        plt.close(self.fig)
 
 if __name__ == "__main__":
     root = tk.Tk()
